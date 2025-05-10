@@ -9,7 +9,7 @@ import json
 import re
 
 # --- Global Constants ---
-MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct" # Model name as a global constant
+MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
 
 # --- Environment Setup ---
 os.environ['CURL_CA_BUNDLE'] = ''
@@ -25,51 +25,96 @@ logger = logging.getLogger(__name__)
 # --- Global Variables for Model and Processor ---
 model = None
 processor = None
+# primary_device will be set to "cuda:0", "mps", or "cpu"
+# It indicates the main device for initial tensor placement and for single-device scenarios.
 primary_device = None
+# model_dtype will be set based on device capabilities
+model_dtype = None
+
 
 def load_model_and_processor():
-    global model, processor, primary_device, MODEL_NAME # Include MODEL_NAME if it were to be modified, but here it's just used
+    global model, processor, primary_device, model_dtype, MODEL_NAME
 
     logger.info(f"Initiating model and processor loading sequence for model: {MODEL_NAME}...")
     overall_start_time = time.perf_counter()
 
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        primary_device = "cuda:0"
-        model_dtype = torch.bfloat16
-        logger.info(f"CUDA is available. {torch.cuda.device_count()} GPU(s) found. Will use device_map='auto'. Primary device for inputs: {primary_device}")
-    else:
+    # --- Advanced Device Detection ---
+    rocm_detected = False
+    if torch.cuda.is_available():
+        # Check if this CUDA is actually ROCm/HIP
+        if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+            rocm_detected = True
+            primary_device = "cuda:0" # ROCm GPUs are addressed as cuda devices
+            model_dtype = torch.bfloat16 # Or torch.float16 if bfloat16 is problematic on your AMD GPU
+            logger.info(f"AMD ROCm detected. {torch.cuda.device_count()} GPU(s) found. Using device_map='auto'. Primary device: {primary_device}, dtype: {model_dtype}")
+        elif torch.cuda.device_count() > 0: # NVIDIA CUDA
+            primary_device = "cuda:0"
+            model_dtype = torch.bfloat16
+            logger.info(f"NVIDIA CUDA detected. {torch.cuda.device_count()} GPU(s) found. Using device_map='auto'. Primary device: {primary_device}, dtype: {model_dtype}")
+        else: # CUDA available but no devices (edge case)
+             logger.warning("torch.cuda.is_available() is True, but no CUDA devices found. Checking MPS.")
+             primary_device = None # Fall through to MPS or CPU
+
+    if primary_device is None and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        primary_device = "mps"
+        model_dtype = torch.float16 # bfloat16 not well supported on MPS, float16 or float32
+        logger.info(f"Apple MPS detected. Using device: {primary_device}, dtype: {model_dtype}. device_map='auto' will target MPS.")
+
+    if primary_device is None: # Fallback to CPU
         primary_device = "cpu"
         model_dtype = torch.float32
-        logger.info("CUDA not available or no GPUs found. Using CPU. device_map='auto' will likely result in CPU usage.")
-    logger.info(f"Selected primary_device for initial tensor placement: {primary_device}")
+        logger.info(f"No CUDA, ROCm, or MPS detected. Using CPU. Device: {primary_device}, dtype: {model_dtype}")
 
+    logger.info(f"Selected primary_device for operations: {primary_device}, model_dtype: {model_dtype}")
+
+    # --- 模型加载 ---
     logger.info(f"开始加载模型 {MODEL_NAME} (using device_map='auto')...")
     start_time_model_load = time.perf_counter()
 
     try:
+        # device_map="auto" will try to use available GPUs (CUDA/ROCm) or fall back to primary_device (MPS/CPU)
+        # For MPS, "auto" should correctly map to the single "mps" device.
         model = AutoModelForImageTextToText.from_pretrained(
-            MODEL_NAME, # Use the global constant
+            MODEL_NAME,
             torch_dtype=model_dtype,
-            device_map="auto",
+            device_map="auto",  # Let accelerate handle device mapping
             trust_remote_code=True
         )
-        logger.info(f"Model {MODEL_NAME} loaded with device_map='auto'.")
+        logger.info(f"Model {MODEL_NAME} loaded.")
         if hasattr(model, 'hf_device_map'):
             logger.info(f"Model device map: {model.hf_device_map}")
+            # The device_map might put parts of the model on CPU if GPU memory is insufficient.
+            # The 'model.device' attribute might point to the device of the first/last parameter or be 'meta'.
+            # We can check where the first parameter actually landed as an indication.
+            first_param_device = next(model.parameters()).device
+            logger.info(f"First model parameter is on device: {first_param_device}")
+            # If device_map led to CPU usage even if a GPU was primary_device, primary_device for inputs should reflect that.
+            # However, inputs.to(primary_device) is generally fine, as accelerate handles internal transfers.
         else:
-            logger.info("Model does not have hf_device_map attribute.")
-        logger.info(f"Model's main device attribute: {model.device}")
+            logger.info(f"Model loaded to single device: {model.device if hasattr(model, 'device') else 'Unknown'}. (No hf_device_map attribute implies not sharded by accelerate, or on CPU/MPS).")
+            # If not sharded, model.device should be reliable.
+            if hasattr(model, 'device') and primary_device != str(model.device):
+                logger.warning(f"Primary device was {primary_device} but model ended up on {model.device}. This might happen if device_map='auto' chose differently.")
+                # primary_device = str(model.device) # Could update primary_device here but let's see
 
     except Exception as e:
-        logger.error(f"Error loading model {MODEL_NAME} with device_map='auto': {e}", exc_info=True)
+        logger.error(f"Error loading model {MODEL_NAME}: {e}", exc_info=True)
         raise
+
+    # Synchronization for timing
+    if primary_device.startswith("cuda"): # Covers NVIDIA CUDA and AMD ROCm
+        torch.cuda.synchronize(device=primary_device.split(':')[0] + (f":{torch.cuda.current_device()}" if ':' not in primary_device else primary_device) if torch.cuda.device_count() > 0 else None) # Sync current device on that backend
+    elif primary_device == "mps":
+        if hasattr(torch, 'mps') and hasattr(torch.mps, 'synchronize'): # Check if mps module and sync exist
+             torch.mps.synchronize()
 
     end_time_model_load = time.perf_counter()
     logger.info(f"模型加载耗时: {end_time_model_load - start_time_model_load:.4f} 秒")
 
+    # --- 处理器加载 ---
     logger.info(f"开始加载处理器 for {MODEL_NAME}...")
     start_time_processor_load = time.perf_counter()
-    processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True) # Use the global constant
+    processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
     end_time_processor_load = time.perf_counter()
     logger.info(f"处理器加载耗时: {end_time_processor_load - start_time_processor_load:.4f} 秒")
 
@@ -79,19 +124,19 @@ def load_model_and_processor():
 
 @app.route('/infer', methods=['POST'])
 def infer_images():
-    global model, processor, primary_device # MODEL_NAME is accessed directly as a global constant
+    global model, processor, primary_device, model_dtype # model_dtype is mostly for loading, but good to have
     if not model or not processor:
         logger.error("Model or processor not loaded before inference call.")
         return jsonify({"code": 503, "error": "Service Unavailable: Model or processor not loaded"}), 503
 
     try:
         request_data = request.get_json()
+        # ... (input validation as before)
         if not request_data:
             logger.warning("No JSON data received in request.")
             return jsonify({"code": 400, "error": "Bad Request: No JSON data received"}), 400
 
         image_urls = request_data.get('images')
-        # Updated default prompt to be more generic for OCR
         custom_prompt = request_data.get('prompt', "Your task is to act as an OCR tool. Please extract all text from the provided image(s) and return it structured as a JSON object. If multiple distinct pieces of information are present (like on an ID card), ensure each piece is a key-value pair in the JSON. For example, for an ID card, keys might include 'name', 'number', 'address', etc.")
 
 
@@ -119,30 +164,45 @@ def infer_images():
         start_time_input_prep = time.perf_counter()
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
-        
+
+        # Inputs should be moved to the primary_device for consistency before model.generate
+        # If device_map="auto" sharded the model, model.generate will handle internal transfers.
         inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
         inputs = inputs.to(primary_device)
 
-        if "cuda" in primary_device:
+        # Synchronize after data transfer to the primary device
+        if primary_device.startswith("cuda"): # Covers NVIDIA and ROCm
             torch.cuda.synchronize(device=primary_device)
+        elif primary_device == "mps":
+            if hasattr(torch, 'mps') and hasattr(torch.mps, 'synchronize'):
+                torch.mps.synchronize()
+
         end_time_input_prep = time.perf_counter()
         logger.info(f"输入数据准备耗时 (包括 .to('{primary_device}')): {end_time_input_prep - start_time_input_prep:.4f} 秒")
 
         logger.info("开始推理 (模型生成)...")
         start_time_inference = time.perf_counter()
         generated_ids = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
-        
+
+        # Synchronize on the device where the output tensor landed
         output_device = generated_ids.device
-        if output_device.type == 'cuda':
+        logger.info(f"Generated IDs tensor is on device: {output_device}")
+        if output_device.type == 'cuda': # Covers NVIDIA and ROCm
              torch.cuda.synchronize(device=output_device)
+        elif output_device.type == 'mps':
+             if hasattr(torch, 'mps') and hasattr(torch.mps, 'synchronize'):
+                torch.mps.synchronize()
 
         end_time_inference = time.perf_counter()
-        logger.info(f"推理 (model.generate) 耗时 (output on {output_device}): {end_time_inference - start_time_inference:.4f} 秒")
+        logger.info(f"推理 (model.generate) 耗时: {end_time_inference - start_time_inference:.4f} 秒")
 
         logger.info("开始后处理 (解码)...")
         start_time_post_processing = time.perf_counter()
+        # Move generated_ids to CPU for decoding
         generated_ids_cpu = generated_ids.to('cpu')
-        input_ids_cpu = inputs.input_ids.to('cpu')
+        # Ensure input_ids are also on CPU for length calculation if they were on GPU
+        input_ids_cpu = inputs.input_ids.to('cpu') if inputs.input_ids.device.type != 'cpu' else inputs.input_ids
+
 
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(input_ids_cpu, generated_ids_cpu)
@@ -154,6 +214,7 @@ def infer_images():
         logger.info(f"模型原始输出: {output_text}")
 
         # --- Response Formatting ---
+        # (Your existing response formatting logic - unchanged)
         parsed_data = None
         response_payload = {}
         http_status_code = 200
@@ -187,7 +248,7 @@ def infer_images():
                 logger.warning(error_msg)
                 response_payload = {"code": 422, "error": "Unprocessable Entity: Model output was not in the expected JSON format.", "raw_model_output": output_text}
                 http_status_code = 422
-        
+
         if not response_payload:
             if parsed_data is not None:
                 response_payload = {"code": 200, "data": parsed_data}
@@ -195,10 +256,10 @@ def infer_images():
                 logger.error("Internal logic error: parsed_data is None but no error response was constructed.")
                 response_payload = {"code": 500, "error": "Internal Server Error: Failed to process model output due to an unexpected state.", "raw_model_output": output_text}
                 http_status_code = 500
-        
+
         inference_total_end_time = time.perf_counter()
         logger.info(f"总推理请求处理耗时 (从接收到图片到生成文本): {inference_total_end_time - inference_total_start_time:.4f} 秒")
-        
+
         return jsonify(response_payload), http_status_code
 
     except Exception as e:
@@ -207,5 +268,7 @@ def infer_images():
 
 
 if __name__ == '__main__':
+    # Ensure 'accelerate' is installed for device_map="auto" to work effectively
+    # pip install accelerate
     load_model_and_processor()
     app.run(host='0.0.0.0', port=5000, debug=False)
