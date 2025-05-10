@@ -1,5 +1,7 @@
 # Qwen2.5-VL-Deploy
 
+> macos 5000 端口被占用，所以使用 8080 端口。
+
 安装：
 ```shell
 pip install -r requirements.txt

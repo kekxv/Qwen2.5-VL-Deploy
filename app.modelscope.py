@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify
 import logging
 import json
 import re
+import sys
 
 # --- Global Constants ---
 MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -272,4 +273,4 @@ if __name__ == '__main__':
   # Ensure 'accelerate' is installed for device_map="auto" to work effectively
   # pip install accelerate
   load_model_and_processor()
-  app.run(host='0.0.0.0', port=5000, debug=False)
+  app.run(host='0.0.0.0', port=8080 if sys.platform == "darwin" else 5000, debug=False)
