@@ -1,5 +1,6 @@
 accelerate==1.6.0
 Flask==3.1.0
+modelscope==1.25.0
 numpy==2.2.5
 pillow==11.2.1
 psutil==7.0.0
