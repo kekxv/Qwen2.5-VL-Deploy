@@ -1,4 +1,4 @@
-# Qwen2.5-VL-Deploy
+# Qwen2.5-VL
 
 > macos 5000 端口被占用，所以使用 8080 端口。
 
@@ -9,9 +9,8 @@ pip install -r requirements.txt
 
 启动：
 ```shell
-python app.huggingface.py
-# 或者
-python app.modelscope.py
+export MODEL_BACKEND="modelscope" # or "huggingface"
+python app.py  
 ```
 
 启动后接口测试：
