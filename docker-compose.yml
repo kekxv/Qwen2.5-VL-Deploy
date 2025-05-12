@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  qwen_vl_service:
+    build:
+      context: . # Looks for Dockerfile in the current directory
+      args:
+        # You can set the backend at build time if needed,
+        # but it's often more flexible to set it at runtime via environment.
+        MODEL_BACKEND_ARG: huggingface # or "modelscope"
+    image: qwen-vl-app:${MODEL_BACKEND:-huggingface} # Tag image based on backend for clarity
+    container_name: qwen_vl_container
+    ports:
+      - "5000:5000" # Map host port 5000 to container port 5000
+    environment:
+      # Override or set runtime environment variables here
+      - MODEL_BACKEND=${MODEL_BACKEND:-huggingface} # Default to huggingface if not set in .env
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
+      - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}
+      - CURL_CA_BUNDLE=${CURL_CA_BUNDLE:-}
+      # For Flask development (optional, app.py already sets debug=False)
+      # - FLASK_ENV=development
+      # - FLASK_DEBUG=1
+    volumes:
+      # Persist model cache to avoid re-downloading on every container start/recreate
+      # The path inside the container (/opt/hf_home) matches ENV HF_HOME in Dockerfile
+      - ./models_cache:/root/.cache
+      # You can also mount your code for development to see changes live (if Flask's reloader is on)
+      # - ./app.py:/app/app.py
+      # - ./qwen_config.py:/app/qwen_config.py
+      # ... and so on for other .py files (tedious for many files)
+    restart: unless-stopped
+
+    # GPU Configuration (requires NVIDIA Container Toolkit on the host)
+    # If you don't have GPUs or don't want to use them, comment out the 'deploy' section.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: "all" # Request 1 GPU. Use "all" to pass all available GPUs.
+              capabilities: [gpu] # Required
+
+networks:
+  default:
+    driver: bridge
+
+# Optional: Define a top-level volume for the cache if you prefer named volumes
+# volumes:
+#   models_cache_vol:
+
