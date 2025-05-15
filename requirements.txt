@@ -12,4 +12,4 @@ sympy==1.14.0
 tokenizers==0.21.1
 torch==2.7.0
 torchvision==0.22.0
-transformers @ git+https://github.com/huggingface/transformers@v4.51.3
+transformers==4.51.3
